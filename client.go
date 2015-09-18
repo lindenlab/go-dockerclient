@@ -124,6 +124,89 @@ func (version APIVersion) compare(other APIVersion) int {
 	return 0
 }
 
+// NewTLSConfigFromFiles creates a tls.Config from the given
+// key and certificate files.
+func NewTLSConfigFromFiles(cert, key, ca string) (*tls.Config, error) {
+	certPEMBlock, err := ioutil.ReadFile(cert)
+	if err != nil {
+		return nil, err
+	}
+	keyPEMBlock, err := ioutil.ReadFile(key)
+	if err != nil {
+		return nil, err
+	}
+	caPEMCert, err := ioutil.ReadFile(ca)
+	if err != nil {
+		return nil, err
+	}
+	return NewTLSConfigFromBytes(certPEMBlock, keyPEMBlock, caPEMCert)
+}
+
+// NewTLSConfigFromBytes creates a tls.Config from the given
+// inline key and certificates.
+func NewTLSConfigFromBytes(certPEMBlock, keyPEMBlock, caPEMCert []byte) (*tls.Config, error) {
+	if certPEMBlock == nil || keyPEMBlock == nil {
+		return nil, errors.New("Both cert and key are required")
+	}
+	tlsCert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
+	if err != nil {
+		return nil, err
+	}
+	tlsConfig := &tls.Config{Certificates: []tls.Certificate{tlsCert}}
+	if caPEMCert == nil {
+		tlsConfig.InsecureSkipVerify = true
+	} else {
+		caPool := x509.NewCertPool()
+		if !caPool.AppendCertsFromPEM(caPEMCert) {
+			return nil, errors.New("Could not add RootCA pem")
+		}
+		tlsConfig.RootCAs = caPool
+	}
+	return tlsConfig, nil
+}
+
+// ClientConfig provides client configuration for use in constructing
+// a new client via NewClientFromConfig
+type ClientConfig struct {
+	TLSConfig        *tls.Config
+	Endpoint         string
+	APIVersionString string
+}
+
+// NewClientConfigFromEnv returns a ClientConfig created from
+// Docker's default logic for the environment variables DOCKER_HOST, DOCKER_TLS_VERIFY, and DOCKER_CERT_PATH.
+//
+// See https://github.com/docker/docker/blob/1f963af697e8df3a78217f6fdbf67b8123a7db94/docker/docker.go#L68.
+// See https://github.com/docker/compose/blob/81707ef1ad94403789166d2fe042c8a718a4c748/compose/cli/docker_client.py#L7.
+func NewClientConfigFromEnv() (*ClientConfig, error) {
+	dockerEnv, err := getDockerEnv()
+	if err != nil {
+		return nil, err
+	}
+	dockerHost := dockerEnv.dockerHost
+	if dockerEnv.dockerTLSVerify {
+		parts := strings.SplitN(dockerHost, "://", 2)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("could not split %s into two parts by ://", dockerHost)
+		}
+		dockerHost = fmt.Sprintf("https://%s", parts[1])
+		cert := filepath.Join(dockerEnv.dockerCertPath, "cert.pem")
+		key := filepath.Join(dockerEnv.dockerCertPath, "key.pem")
+		ca := filepath.Join(dockerEnv.dockerCertPath, "ca.pem")
+		tlsConfig, err := NewTLSConfigFromFiles(cert, key, ca)
+		if err != nil {
+			return nil, err
+		}
+		return &ClientConfig{
+			Endpoint:  dockerHost,
+			TLSConfig: tlsConfig,
+		}, nil
+	}
+	return &ClientConfig{
+		Endpoint: dockerHost,
+	}, nil
+}
+
 // Client is the basic type of this package. It provides methods for
 // interaction with the API.
 type Client struct {
@@ -142,63 +225,94 @@ type Client struct {
 }
 
 // NewClient returns a Client instance ready for communication with the given
-// server endpoint. It will use the latest remote API version available in the
-// server.
-func NewClient(endpoint string) (*Client, error) {
-	client, err := NewVersionedClient(endpoint, "")
+// client configuration.
+func NewClientFromConfig(config *ClientConfig) (*Client, error) {
+	var (
+		requestedAPIVersion APIVersion
+		err                 error
+	)
+	skipServerVersionCheck := true
+	if strings.Contains(config.APIVersionString, ".") {
+		skipServerVersionCheck = false
+		requestedAPIVersion, err = NewAPIVersion(config.APIVersionString)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	tlsEnabled := (config.TLSConfig != nil)
+	u, err := parseEndpoint(config.Endpoint, tlsEnabled)
 	if err != nil {
 		return nil, err
 	}
-	client.SkipServerVersionCheck = true
+
+	client := &Client{
+		TLSConfig:              config.TLSConfig,
+		Dialer:                 &net.Dialer{},
+		endpoint:               config.Endpoint,
+		endpointURL:            u,
+		eventMonitor:           new(eventMonitoringState),
+		requestedAPIVersion:    requestedAPIVersion,
+		SkipServerVersionCheck: skipServerVersionCheck,
+	}
+
+	if config.TLSConfig != nil {
+		client.HTTPClient = &http.Client{
+			Transport: &http.Transport{
+				TLSClientConfig: config.TLSConfig,
+			},
+		}
+	} else {
+		client.HTTPClient = http.DefaultClient
+	}
+
 	return client, nil
+}
+
+// NewClient returns a Client instance ready for communication with the given
+// server endpoint. It will use the latest remote API version available in the
+// server.
+func NewClient(endpoint string) (*Client, error) {
+	return NewClientFromConfig(&ClientConfig{
+		Endpoint: endpoint,
+	})
 }
 
 // NewTLSClient returns a Client instance ready for TLS communications with the givens
 // server endpoint, key and certificates . It will use the latest remote API version
 // available in the server.
 func NewTLSClient(endpoint string, cert, key, ca string) (*Client, error) {
-	client, err := NewVersionedTLSClient(endpoint, cert, key, ca, "")
+	tlsConfig, err := NewTLSConfigFromFiles(cert, key, ca)
 	if err != nil {
 		return nil, err
 	}
-	client.SkipServerVersionCheck = true
-	return client, nil
+	return NewClientFromConfig(&ClientConfig{
+		Endpoint:  endpoint,
+		TLSConfig: tlsConfig,
+	})
 }
 
 // NewTLSClientFromBytes returns a Client instance ready for TLS communications with the givens
 // server endpoint, key and certificates (passed inline to the function as opposed to being
 // read from a local file). It will use the latest remote API version available in the server.
 func NewTLSClientFromBytes(endpoint string, certPEMBlock, keyPEMBlock, caPEMCert []byte) (*Client, error) {
-	client, err := NewVersionedTLSClientFromBytes(endpoint, certPEMBlock, keyPEMBlock, caPEMCert, "")
+	tlsConfig, err := NewTLSConfigFromBytes(certPEMBlock, keyPEMBlock, caPEMCert)
 	if err != nil {
 		return nil, err
 	}
-	client.SkipServerVersionCheck = true
-	return client, nil
+	return NewClientFromConfig(&ClientConfig{
+		Endpoint:  endpoint,
+		TLSConfig: tlsConfig,
+	})
 }
 
 // NewVersionedClient returns a Client instance ready for communication with
 // the given server endpoint, using a specific remote API version.
 func NewVersionedClient(endpoint string, apiVersionString string) (*Client, error) {
-	u, err := parseEndpoint(endpoint, false)
-	if err != nil {
-		return nil, err
-	}
-	var requestedAPIVersion APIVersion
-	if strings.Contains(apiVersionString, ".") {
-		requestedAPIVersion, err = NewAPIVersion(apiVersionString)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return &Client{
-		HTTPClient:          http.DefaultClient,
-		Dialer:              &net.Dialer{},
-		endpoint:            endpoint,
-		endpointURL:         u,
-		eventMonitor:        new(eventMonitoringState),
-		requestedAPIVersion: requestedAPIVersion,
-	}, nil
+	return NewClientFromConfig(&ClientConfig{
+		Endpoint:         endpoint,
+		APIVersionString: apiVersionString,
+	})
 }
 
 // NewVersionnedTLSClient has been DEPRECATED, please use NewVersionedTLSClient.
@@ -209,19 +323,15 @@ func NewVersionnedTLSClient(endpoint string, cert, key, ca, apiVersionString str
 // NewVersionedTLSClient returns a Client instance ready for TLS communications with the givens
 // server endpoint, key and certificates, using a specific remote API version.
 func NewVersionedTLSClient(endpoint string, cert, key, ca, apiVersionString string) (*Client, error) {
-	certPEMBlock, err := ioutil.ReadFile(cert)
+	tlsConfig, err := NewTLSConfigFromFiles(cert, key, ca)
 	if err != nil {
 		return nil, err
 	}
-	keyPEMBlock, err := ioutil.ReadFile(key)
-	if err != nil {
-		return nil, err
-	}
-	caPEMCert, err := ioutil.ReadFile(ca)
-	if err != nil {
-		return nil, err
-	}
-	return NewVersionedTLSClientFromBytes(endpoint, certPEMBlock, keyPEMBlock, caPEMCert, apiVersionString)
+	return NewClientFromConfig(&ClientConfig{
+		Endpoint:         endpoint,
+		TLSConfig:        tlsConfig,
+		APIVersionString: apiVersionString,
+	})
 }
 
 // NewClientFromEnv returns a Client instance ready for communication created from
@@ -230,12 +340,11 @@ func NewVersionedTLSClient(endpoint string, cert, key, ca, apiVersionString stri
 // See https://github.com/docker/docker/blob/1f963af697e8df3a78217f6fdbf67b8123a7db94/docker/docker.go#L68.
 // See https://github.com/docker/compose/blob/81707ef1ad94403789166d2fe042c8a718a4c748/compose/cli/docker_client.py#L7.
 func NewClientFromEnv() (*Client, error) {
-	client, err := NewVersionedClientFromEnv("")
+	config, err := NewClientConfigFromEnv()
 	if err != nil {
 		return nil, err
 	}
-	client.SkipServerVersionCheck = true
-	return client, nil
+	return NewClientFromConfig(config)
 }
 
 // NewVersionedClientFromEnv returns a Client instance ready for TLS communications created from
@@ -245,72 +354,27 @@ func NewClientFromEnv() (*Client, error) {
 // See https://github.com/docker/docker/blob/1f963af697e8df3a78217f6fdbf67b8123a7db94/docker/docker.go#L68.
 // See https://github.com/docker/compose/blob/81707ef1ad94403789166d2fe042c8a718a4c748/compose/cli/docker_client.py#L7.
 func NewVersionedClientFromEnv(apiVersionString string) (*Client, error) {
-	dockerEnv, err := getDockerEnv()
+	config, err := NewClientConfigFromEnv()
 	if err != nil {
 		return nil, err
 	}
-	dockerHost := dockerEnv.dockerHost
-	if dockerEnv.dockerTLSVerify {
-		parts := strings.SplitN(dockerHost, "://", 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("could not split %s into two parts by ://", dockerHost)
-		}
-		dockerHost = fmt.Sprintf("https://%s", parts[1])
-		cert := filepath.Join(dockerEnv.dockerCertPath, "cert.pem")
-		key := filepath.Join(dockerEnv.dockerCertPath, "key.pem")
-		ca := filepath.Join(dockerEnv.dockerCertPath, "ca.pem")
-		return NewVersionedTLSClient(dockerHost, cert, key, ca, apiVersionString)
-	}
-	return NewVersionedClient(dockerHost, apiVersionString)
+	config.APIVersionString = apiVersionString
+	return NewClientFromConfig(config)
 }
 
 // NewVersionedTLSClientFromBytes returns a Client instance ready for TLS communications with the givens
 // server endpoint, key and certificates (passed inline to the function as opposed to being
 // read from a local file), using a specific remote API version.
 func NewVersionedTLSClientFromBytes(endpoint string, certPEMBlock, keyPEMBlock, caPEMCert []byte, apiVersionString string) (*Client, error) {
-	u, err := parseEndpoint(endpoint, true)
+	tlsConfig, err := NewTLSConfigFromBytes(certPEMBlock, keyPEMBlock, caPEMCert)
 	if err != nil {
 		return nil, err
 	}
-	var requestedAPIVersion APIVersion
-	if strings.Contains(apiVersionString, ".") {
-		requestedAPIVersion, err = NewAPIVersion(apiVersionString)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if certPEMBlock == nil || keyPEMBlock == nil {
-		return nil, errors.New("Both cert and key are required")
-	}
-	tlsCert, err := tls.X509KeyPair(certPEMBlock, keyPEMBlock)
-	if err != nil {
-		return nil, err
-	}
-	tlsConfig := &tls.Config{Certificates: []tls.Certificate{tlsCert}}
-	if caPEMCert == nil {
-		tlsConfig.InsecureSkipVerify = true
-	} else {
-		caPool := x509.NewCertPool()
-		if !caPool.AppendCertsFromPEM(caPEMCert) {
-			return nil, errors.New("Could not add RootCA pem")
-		}
-		tlsConfig.RootCAs = caPool
-	}
-	tr := &http.Transport{
-		TLSClientConfig: tlsConfig,
-	}
-	if err != nil {
-		return nil, err
-	}
-	return &Client{
-		HTTPClient:          &http.Client{Transport: tr},
-		TLSConfig:           tlsConfig,
-		Dialer:              &net.Dialer{},
-		endpoint:            endpoint,
-		endpointURL:         u,
-		eventMonitor:        new(eventMonitoringState),
-		requestedAPIVersion: requestedAPIVersion,
-	}, nil
+	return NewClientFromConfig(&ClientConfig{
+		Endpoint:         endpoint,
+		TLSConfig:        tlsConfig,
+		APIVersionString: apiVersionString,
+	})
 }
 
 func (c *Client) checkAPIVersion() error {
