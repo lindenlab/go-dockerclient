@@ -36,7 +36,7 @@ import (
 )
 
 const (
-	userAgent = "go-dockerclient"
+	userAgent  = "go-dockerclient"
 	DEFAULTTAG = "latest"
 )
 

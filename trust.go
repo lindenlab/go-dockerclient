@@ -4,15 +4,20 @@ package docker
 // Sadly, since this code is not in a 'pkg' for use externally, we duplicate a subset of that code here.
 
 import (
+	"bufio"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,6 +26,8 @@ import (
 	"github.com/fsouza/go-dockerclient/external/github.com/docker/distribution/digest"
 	"github.com/fsouza/go-dockerclient/external/github.com/docker/distribution/registry/client/auth"
 	"github.com/fsouza/go-dockerclient/external/github.com/docker/distribution/registry/client/transport"
+	"github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/ansiescape"
+	"github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/ioutils"
 	"github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/tlsconfig"
 	"github.com/fsouza/go-dockerclient/external/github.com/docker/notary/client"
 	"github.com/fsouza/go-dockerclient/external/github.com/docker/notary/pkg/passphrase"
@@ -31,6 +38,8 @@ const (
 	// OfficialNotaryServer is the endpoint serving the official Notary trust server
 	OfficialNotaryServer = "https://notary.docker.io"
 )
+
+var targetRegexp = regexp.MustCompile(`([\S]+): digest: ([\S]+) size: ([\d]+)`)
 
 func (c *Client) trustServer(index *registry.IndexInfo) string {
 	if c.ContentTrustServer != "" {
@@ -282,4 +291,58 @@ func (c *Client) tagTrusted(repoInfo *registry.RepositoryInfo, dgst digest.Diges
 		return fmt.Errorf("Error tagging trusted image: %s", err)
 	}
 	return nil
+}
+
+func targetStream(in io.Writer) (io.WriteCloser, <-chan []target) {
+	r, w := io.Pipe()
+	out := io.MultiWriter(in, w)
+	targetChan := make(chan []target)
+
+	go func() {
+		targets := []target{}
+		scanner := bufio.NewScanner(r)
+		scanner.Split(ansiescape.ScanANSILines)
+		for scanner.Scan() {
+			line := scanner.Bytes()
+			if matches := targetRegexp.FindSubmatch(line); len(matches) == 4 {
+				dgst, err := digest.ParseDigest(string(matches[2]))
+				if err != nil {
+					// Line does match what is expected, continue looking for valid lines
+					//logrus.Debugf("Bad digest value %q in matched line, ignoring\n", string(matches[2]))
+					continue
+				}
+				s, err := strconv.ParseInt(string(matches[3]), 10, 64)
+				if err != nil {
+					// Line does match what is expected, continue looking for valid lines
+					//logrus.Debugf("Bad size value %q in matched line, ignoring\n", string(matches[3]))
+					continue
+				}
+
+				targets = append(targets, target{
+					tag:    string(matches[1]),
+					digest: dgst,
+					size:   s,
+				})
+			}
+		}
+		targetChan <- targets
+	}()
+
+	return ioutils.NewWriteCloserWrapper(out, w.Close), targetChan
+}
+
+func selectKey(keys map[string]string) string {
+	if len(keys) == 0 {
+		return ""
+	}
+
+	keyIDs := []string{}
+	for k := range keys {
+		keyIDs = append(keyIDs, k)
+	}
+
+	// TODO(dmcgowan): let user choose if multiple keys, now pick consistently
+	sort.Strings(keyIDs)
+
+	return keyIDs[0]
 }

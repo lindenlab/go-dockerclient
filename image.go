@@ -7,6 +7,7 @@ package docker
 import (
 	"bytes"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,9 @@ import (
 	"time"
 
 	"github.com/fsouza/go-dockerclient/registry"
+
+	"github.com/fsouza/go-dockerclient/external/github.com/docker/notary/client"
+	"github.com/fsouza/go-dockerclient/external/github.com/endophage/gotuf/data"
 )
 
 // APIImages represent an image returned in the ListImages call.
@@ -246,9 +250,97 @@ type PushImageOptions struct {
 //
 // See https://goo.gl/zPtZaT for more details.
 func (c *Client) PushImage(opts PushImageOptions, auth AuthConfiguration) error {
+	if c.ContentTrustEnabled {
+		return c.PushImageTrusted(opts, auth)
+	}
+	return c.pushImage(opts, auth)
+}
+
+func (c *Client) PushImageTrusted(opts PushImageOptions, authConfig AuthConfiguration) error {
+	if opts.Tag == "" {
+		return fmt.Errorf("No tag specified, cannot push trust metadata\n")
+	}
+	streamOut, targetChan := targetStream(opts.OutputStream)
+	opts.OutputStream = streamOut
+
+	err := c.pushImage(opts, authConfig)
+	// Close stream channel to finish target parsing
+	if err := streamOut.Close(); err != nil {
+		return err
+	}
+	// Check error from request
+	if err != nil {
+		return err
+	}
+
+	// Get target results
+	targets := <-targetChan
+
+	if len(targets) == 0 {
+		// no targets found; skip trust metadata push
+		return nil
+	}
+
+	repoInfo, err := registry.ParseRepositoryInfo(opts.Name)
+	if err != nil {
+		return err
+	}
+	repo, err := c.getNotaryRepository(repoInfo, authConfig)
+	if err != nil {
+		return fmt.Errorf("Error establishing connection to notary repository: %s", err)
+	}
+
+	for _, target := range targets {
+		h, err := hex.DecodeString(target.digest.Hex())
+		if err != nil {
+			return err
+		}
+		t := &client.Target{
+			Name: target.tag,
+			Hashes: data.Hashes{
+				string(target.digest.Algorithm()): h,
+			},
+			Length: int64(target.size),
+		}
+		if err := repo.AddTarget(t); err != nil {
+			return err
+		}
+	}
+
+	err = repo.Publish()
+	if _, ok := err.(*client.ErrRepoNotInitialized); !ok {
+		return notaryError(err)
+	}
+
+	ks := repo.KeyStoreManager
+	keys := ks.RootKeyStore().ListKeys()
+
+	rootKey := selectKey(keys)
+	if rootKey == "" {
+		rootKey, err = ks.GenRootKey("ecdsa")
+		if err != nil {
+			return err
+		}
+	}
+
+	cryptoService, err := ks.GetRootCryptoService(rootKey)
+	if err != nil {
+		return err
+	}
+
+	if err := repo.Initialize(cryptoService); err != nil {
+		return notaryError(err)
+	}
+	//fmt.Fprintf(cli.out, "Finished initializing %q\n", repoInfo.CanonicalName)
+
+	return notaryError(repo.Publish())
+}
+
+func (c *Client) pushImage(opts PushImageOptions, auth AuthConfiguration) error {
 	if opts.Name == "" {
 		return ErrNoSuchImage
 	}
+
 	headers, err := headersWithAuth(auth)
 	if err != nil {
 		return err
@@ -285,13 +377,13 @@ func (c *Client) PullImage(opts PullImageOptions, auth AuthConfiguration) error 
 		return ErrNoSuchImage
 	}
 
+	if c.ContentTrustEnabled && !registry.IsDigest(opts.Tag) {
+		return c.PullImageTrusted(opts, auth)
+	}
+
 	headers, err := headersWithAuth(auth)
 	if err != nil {
 		return err
-	}
-
-	if c.ContentTrustEnabled && !registry.IsDigest(opts.Tag) {
-		return c.PullImageTrusted(opts, auth)
 	}
 
 	return c.createImage(queryString(&opts), headers, nil, opts.OutputStream, opts.RawJSONStream)
