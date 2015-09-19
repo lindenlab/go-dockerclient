@@ -135,9 +135,12 @@ func NewTLSConfigFromFiles(cert, key, ca string) (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	caPEMCert, err := ioutil.ReadFile(ca)
-	if err != nil {
-		return nil, err
+	var caPEMCert []byte
+	if ca != "" {
+		caPEMCert, err = ioutil.ReadFile(ca)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return NewTLSConfigFromBytes(certPEMBlock, keyPEMBlock, caPEMCert)
 }
@@ -168,9 +171,13 @@ func NewTLSConfigFromBytes(certPEMBlock, keyPEMBlock, caPEMCert []byte) (*tls.Co
 // ClientConfig provides client configuration for use in constructing
 // a new client via NewClientFromConfig
 type ClientConfig struct {
-	TLSConfig        *tls.Config
-	Endpoint         string
-	APIVersionString string
+	TLSConfig           *tls.Config
+	ConfigPath          string
+	Endpoint            string
+	APIVersionString    string
+	ContentTrustEnabled bool
+	ContentTrustServer  string
+	ContentTrustFromEnv bool
 }
 
 // NewClientConfigFromEnv returns a ClientConfig created from
@@ -183,38 +190,44 @@ func NewClientConfigFromEnv() (*ClientConfig, error) {
 	if err != nil {
 		return nil, err
 	}
+	config := &ClientConfig{
+		ContentTrustEnabled: dockerEnv.dockerContentTrustEnabled,
+		ContentTrustServer:  dockerEnv.dockerContentTrustServer,
+		ContentTrustFromEnv: true,
+		ConfigPath:          dockerEnv.dockerConfigPath,
+	}
 	dockerHost := dockerEnv.dockerHost
 	if dockerEnv.dockerTLSVerify {
 		parts := strings.SplitN(dockerHost, "://", 2)
 		if len(parts) != 2 {
 			return nil, fmt.Errorf("could not split %s into two parts by ://", dockerHost)
 		}
-		dockerHost = fmt.Sprintf("https://%s", parts[1])
+		config.Endpoint = fmt.Sprintf("https://%s", parts[1])
 		cert := filepath.Join(dockerEnv.dockerCertPath, "cert.pem")
 		key := filepath.Join(dockerEnv.dockerCertPath, "key.pem")
 		ca := filepath.Join(dockerEnv.dockerCertPath, "ca.pem")
-		tlsConfig, err := NewTLSConfigFromFiles(cert, key, ca)
+		config.TLSConfig, err = NewTLSConfigFromFiles(cert, key, ca)
 		if err != nil {
 			return nil, err
 		}
-		return &ClientConfig{
-			Endpoint:  dockerHost,
-			TLSConfig: tlsConfig,
-		}, nil
+	} else {
+		config.Endpoint = dockerHost
 	}
-	return &ClientConfig{
-		Endpoint: dockerHost,
-	}, nil
+	return config, nil
 }
 
 // Client is the basic type of this package. It provides methods for
 // interaction with the API.
 type Client struct {
 	SkipServerVersionCheck bool
+	ContentTrustEnabled    bool
+	ContentTrustServer     string
+	ContentTrustFromEnv    bool
 	HTTPClient             *http.Client
 	TLSConfig              *tls.Config
 	Dialer                 *net.Dialer
 
+	configPath          string
 	endpoint            string
 	endpointURL         *url.URL
 	eventMonitor        *eventMonitoringState
@@ -246,14 +259,29 @@ func NewClientFromConfig(config *ClientConfig) (*Client, error) {
 		return nil, err
 	}
 
+	configPath := config.ConfigPath
+	if configPath == "" {
+		configPath := os.Getenv("DOCKER_CONFIG")
+		if configPath == "" {
+			home := homedir.Get()
+			if home != "" {
+				configPath = filepath.Join(homedir.Get(), ".docker")
+			}
+		}
+	}
+
 	client := &Client{
 		TLSConfig:              config.TLSConfig,
 		Dialer:                 &net.Dialer{},
+		configPath:             configPath,
 		endpoint:               config.Endpoint,
 		endpointURL:            u,
 		eventMonitor:           new(eventMonitoringState),
 		requestedAPIVersion:    requestedAPIVersion,
 		SkipServerVersionCheck: skipServerVersionCheck,
+		ContentTrustEnabled:    config.ContentTrustEnabled,
+		ContentTrustServer:     config.ContentTrustServer,
+		ContentTrustFromEnv:    config.ContentTrustFromEnv,
 	}
 
 	if config.TLSConfig != nil {
@@ -889,9 +917,12 @@ func parseEndpoint(endpoint string, tls bool) (*url.URL, error) {
 }
 
 type dockerEnv struct {
-	dockerHost      string
-	dockerTLSVerify bool
-	dockerCertPath  string
+	dockerHost                string
+	dockerTLSVerify           bool
+	dockerConfigPath          string
+	dockerCertPath            string
+	dockerContentTrustEnabled bool
+	dockerContentTrustServer  string
 }
 
 func getDockerEnv() (*dockerEnv, error) {
@@ -904,25 +935,44 @@ func getDockerEnv() (*dockerEnv, error) {
 		}
 	}
 	dockerTLSVerify := os.Getenv("DOCKER_TLS_VERIFY") != ""
+	dockerConfigPath := os.Getenv("DOCKER_CONFIG")
+	if dockerConfigPath == "" {
+		home := homedir.Get()
+		if home != "" {
+			dockerConfigPath = filepath.Join(homedir.Get(), ".docker")
+		}
+	}
+
 	var dockerCertPath string
 	if dockerTLSVerify {
 		dockerCertPath = os.Getenv("DOCKER_CERT_PATH")
 		if dockerCertPath == "" {
-			home := homedir.Get()
-			if home == "" {
-				return nil, errors.New("environment variable HOME must be set if DOCKER_CERT_PATH is not set")
+			if dockerConfigPath == "" {
+				return nil, errors.New("environment variable HOME or DOCKER_CONFIG must be set if DOCKER_CERT_PATH is not set")
 			}
-			dockerCertPath = filepath.Join(home, ".docker")
+			dockerCertPath = filepath.Join(dockerConfigPath, ".docker")
 			dockerCertPath, err = filepath.Abs(dockerCertPath)
 			if err != nil {
 				return nil, err
 			}
 		}
 	}
+	dockerContentTrustEnabled := false
+	if e := os.Getenv("DOCKER_CONTENT_TRUST"); e != "" {
+		if t, err := strconv.ParseBool(e); t || err != nil {
+			// treat any other value as true
+			dockerContentTrustEnabled = true
+		}
+	}
+
+	dockerContentTrustServer := os.Getenv("DOCKER_CONTENT_TRUST_SERVER")
 	return &dockerEnv{
-		dockerHost:      dockerHost,
-		dockerTLSVerify: dockerTLSVerify,
-		dockerCertPath:  dockerCertPath,
+		dockerHost:                dockerHost,
+		dockerTLSVerify:           dockerTLSVerify,
+		dockerConfigPath:          dockerConfigPath,
+		dockerCertPath:            dockerCertPath,
+		dockerContentTrustEnabled: dockerContentTrustEnabled,
+		dockerContentTrustServer:  dockerContentTrustServer,
 	}, nil
 }
 
