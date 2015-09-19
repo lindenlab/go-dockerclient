@@ -14,6 +14,10 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/fsouza/go-dockerclient/registry"
+
+	"github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/parsers"
 )
 
 // ErrContainerAlreadyExists is the error returned by CreateContainer when the
@@ -367,6 +371,29 @@ type CreateContainerOptions struct {
 //
 // See https://goo.gl/WxQzrr for more details.
 func (c *Client) CreateContainer(opts CreateContainerOptions) (*Container, error) {
+	_, tag := parsers.ParseRepositoryTag(opts.Config.Image)
+
+	if c.ContentTrustEnabled && !registry.IsDigest(tag) {
+		return c.CreateContainerTrusted(opts, AuthConfiguration{})
+	}
+
+	return c.createContainer(opts)
+}
+
+func (c *Client) CreateContainerTrusted(opts CreateContainerOptions, authConfig AuthConfiguration) (*Container, error) {
+	repos, tag := parsers.ParseRepositoryTag(opts.Config.Image)
+	if tag == "" {
+		tag = DEFAULTTAG
+	}
+	trustedTarget, err := c.trustedTarget(repos, tag, authConfig)
+	if err != nil {
+		return nil, err
+	}
+	opts.Config.Image = trustedTarget.ImageName(repos)
+	return c.createContainer(opts)
+}
+
+func (c *Client) createContainer(opts CreateContainerOptions) (*Container, error) {
 	path := "/containers/create?" + queryString(opts)
 	resp, err := c.do(
 		"POST",

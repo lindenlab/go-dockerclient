@@ -180,6 +180,59 @@ func (c *Client) getNotaryRepository(repoInfo *registry.RepositoryInfo, authConf
 	return client.NewNotaryRepository(c.trustDirectory(), repoInfo.CanonicalName, server, tr, c.getPassphraseRetriever())
 }
 
+func (c *Client) trustedTargets(repo, tag string, authConfig AuthConfiguration) ([]target, error) {
+	repoInfo, err := registry.ParseRepositoryInfo(repo)
+	if err != nil {
+		return nil, err
+	}
+
+	notaryRepo, err := c.getNotaryRepository(repoInfo, authConfig)
+	if err != nil {
+		return nil, fmt.Errorf("Error establishing connection to trust repository: %s", err)
+	}
+
+	targets := []target{}
+	if tag == "" {
+		// List all targets
+		tgts, err := notaryRepo.ListTargets()
+		if err != nil {
+			return nil, notaryError(err)
+		}
+		for _, tgt := range tgts {
+			t, err := convertTarget(*tgt)
+			if err != nil {
+				//fmt.Fprintf(cli.out, "Skipping target for %q\n", repoInfo.LocalName)
+				continue
+			}
+			targets = append(targets, t)
+		}
+	} else {
+		t, err := notaryRepo.GetTargetByName(tag)
+		if err != nil {
+			return nil, notaryError(err)
+		}
+		r, err := convertTarget(*t)
+		if err != nil {
+			return nil, err
+
+		}
+		targets = append(targets, r)
+	}
+
+	return targets, nil
+}
+
+func (c *Client) trustedTarget(repos, tag string, authConfig AuthConfiguration) (target, error) {
+	targets, err := c.trustedTargets(repos, tag, authConfig)
+	if err != nil {
+		return target{}, err
+	}
+	if len(targets) != 1 {
+		return target{}, fmt.Errorf("Unexpected number of trusted targets returned: %d", len(targets))
+	}
+	return targets[0], nil
+}
+
 func notaryError(err error) error {
 	switch err.(type) {
 	case *json.SyntaxError:
@@ -198,6 +251,10 @@ type target struct {
 	tag    string
 	digest digest.Digest
 	size   int64
+}
+
+func (t *target) ImageName(repo string) string {
+	return fmt.Sprintf("%s@%s", repo, t.digest.String())
 }
 
 func convertTarget(t client.Target) (target, error) {

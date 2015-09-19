@@ -297,53 +297,24 @@ func (c *Client) PullImage(opts PullImageOptions, auth AuthConfiguration) error 
 	return c.createImage(queryString(&opts), headers, nil, opts.OutputStream, opts.RawJSONStream)
 }
 
-func (c *Client) PullImageTrusted(opts PullImageOptions, auth AuthConfiguration) error {
+func (c *Client) PullImageTrusted(opts PullImageOptions, authConfig AuthConfiguration) error {
+	targets, err := c.trustedTargets(opts.Repository, opts.Tag, authConfig)
+	if err != nil {
+		return err
+	}
+
+	headers, err := headersWithAuth(authConfig)
+	if err != nil {
+		return err
+	}
+
 	repoInfo, err := registry.ParseRepositoryInfo(opts.Repository)
 	if err != nil {
 		return err
 	}
-
-	headers, err := headersWithAuth(auth)
-	if err != nil {
-		return err
-	}
-
-	notaryRepo, err := c.getNotaryRepository(repoInfo, auth)
-	if err != nil {
-		return fmt.Errorf("Error establishing connection to trust repository: %s", err)
-	}
-
-	refs := []target{}
-	if opts.Tag == "" {
-		// List all targets
-		targets, err := notaryRepo.ListTargets()
-		if err != nil {
-			return notaryError(err)
-		}
-		for _, tgt := range targets {
-			t, err := convertTarget(*tgt)
-			if err != nil {
-				//fmt.Fprintf(cli.out, "Skipping target for %q\n", repoInfo.LocalName)
-				continue
-			}
-			refs = append(refs, t)
-		}
-	} else {
-		t, err := notaryRepo.GetTargetByName(opts.Tag)
-		if err != nil {
-			return notaryError(err)
-		}
-		r, err := convertTarget(*t)
-		if err != nil {
-			return err
-
-		}
-		refs = append(refs, r)
-	}
-
 	opts.Repository = repoInfo.LocalName
-	for _, r := range refs {
-		opts.Tag = r.digest.String()
+	for _, t := range targets {
+		opts.Tag = t.digest.String()
 
 		err = c.createImage(queryString(&opts), headers, nil, opts.OutputStream, opts.RawJSONStream)
 		if err != nil {
@@ -351,8 +322,8 @@ func (c *Client) PullImageTrusted(opts PullImageOptions, auth AuthConfiguration)
 		}
 
 		// If reference is not trusted, tag by trusted reference
-		if !registry.IsDigest(r.tag) {
-			if err := c.tagTrusted(repoInfo, r.digest, r.tag); err != nil {
+		if !registry.IsDigest(t.tag) {
+			if err := c.tagTrusted(repoInfo, t.digest, t.tag); err != nil {
 				return err
 
 			}

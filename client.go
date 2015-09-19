@@ -35,7 +35,10 @@ import (
 	"github.com/fsouza/go-dockerclient/external/github.com/docker/docker/pkg/stdcopy"
 )
 
-const userAgent = "go-dockerclient"
+const (
+	userAgent = "go-dockerclient"
+	DEFAULTTAG = "latest"
+)
 
 var (
 	// ErrInvalidEndpoint is returned when the endpoint is not a valid HTTP URL.
