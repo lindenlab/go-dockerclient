@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"net/http"
 	"net/url"
 	"os"
@@ -310,6 +311,9 @@ func (c *Client) tagTrusted(repoInfo *registry.RepositoryInfo, dgst digest.Diges
 }
 
 func targetStream(in io.Writer) (io.WriteCloser, <-chan []target) {
+	if in == nil {
+		in = ioutil.Discard
+	}
 	r, w := io.Pipe()
 	out := io.MultiWriter(in, w)
 	targetChan := make(chan []target)
