@@ -20,6 +20,7 @@ import (
 	"github.com/fsouza/go-dockerclient/registry"
 
 	"github.com/fsouza/go-dockerclient/external/github.com/docker/notary/client"
+	"github.com/fsouza/go-dockerclient/external/github.com/docker/notary/pkg/passphrase"
 	"github.com/fsouza/go-dockerclient/external/github.com/endophage/gotuf/data"
 )
 
@@ -251,12 +252,12 @@ type PushImageOptions struct {
 // See https://goo.gl/zPtZaT for more details.
 func (c *Client) PushImage(opts PushImageOptions, auth AuthConfiguration) error {
 	if c.ContentTrustEnabled {
-		return c.PushImageTrusted(opts, auth)
+		return c.PushImageTrusted(opts, auth, nil)
 	}
 	return c.pushImage(opts, auth)
 }
 
-func (c *Client) PushImageTrusted(opts PushImageOptions, authConfig AuthConfiguration) error {
+func (c *Client) PushImageTrusted(opts PushImageOptions, authConfig AuthConfiguration, passphraseRetriever passphrase.Retriever) error {
 	if opts.Tag == "" {
 		return fmt.Errorf("No tag specified, cannot push trust metadata\n")
 	}
@@ -285,7 +286,7 @@ func (c *Client) PushImageTrusted(opts PushImageOptions, authConfig AuthConfigur
 	if err != nil {
 		return err
 	}
-	repo, err := c.getNotaryRepository(repoInfo, authConfig)
+	repo, err := c.getNotaryRepository(repoInfo, authConfig, passphraseRetriever)
 	if err != nil {
 		return fmt.Errorf("Error establishing connection to notary repository: %s", err)
 	}

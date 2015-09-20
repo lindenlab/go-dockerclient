@@ -99,21 +99,26 @@ func (scs simpleCredentialStore) Basic(u *url.URL) (string, string) {
 	return scs.auth.Username, scs.auth.Password
 }
 
-func (c *Client) getPassphraseRetriever() passphrase.Retriever {
-	// *TODO: Implement additional passphrase strategies.
-	env := map[string]string{}
-	if c.ContentTrustFromEnv {
-		env["root"] = os.Getenv("DOCKER_CONTENT_TRUST_OFFLINE_PASSPHRASE")
-		env["snapshot"] = os.Getenv("DOCKER_CONTENT_TRUST_TAGGING_PASSPHRASE")
-		env["targets"] = os.Getenv("DOCKER_CONTENT_TRUST_TAGGING_PASSPHRASE")
+func NewPassphraseRetrieverFromEnv() passphrase.Retriever {
+	offline := os.Getenv("DOCKER_CONTENT_TRUST_OFFLINE_PASSPHRASE")
+	tagging := os.Getenv("DOCKER_CONTENT_TRUST_TAGGING_PASSPHRASE")
+	return NewPassphraseRetriever(offline, tagging)
+}
+
+func NewPassphraseRetriever(offline, tagging string) passphrase.Retriever {
+	passphrases := map[string]string{
+		"root":     offline,
+		"snapshot": tagging,
+		"targets":  tagging,
 	}
 	return func(keyName string, alias string, createNew bool, numAttempts int) (string, bool, error) {
-		if v := env[alias]; v != "" {
+		if v := passphrases[alias]; v != "" {
 			return v, numAttempts > 1, nil
 		}
-		return "", false, errors.New("Passphrase mismatch")
+		return "", false, fmt.Errorf("No passphrase provided for %s key with name %s", alias, keyName)
 	}
 }
+
 
 func (c *Client) newTLSConfig(hostname string, serverClient bool) (*tls.Config, error) {
 	// PreferredServerCipherSuites should have no effect
@@ -154,7 +159,7 @@ func (c *Client) NewHTTPSClient(server string, serverClient bool) (*http.Client,
 	}, base, modifiers, nil
 }
 
-func (c *Client) getNotaryRepository(repoInfo *registry.RepositoryInfo, authConfig AuthConfiguration) (*client.NotaryRepository, error) {
+func (c *Client) getNotaryRepository(repoInfo *registry.RepositoryInfo, authConfig AuthConfiguration, passphraseRetriever passphrase.Retriever) (*client.NotaryRepository, error) {
 	server := c.trustServer(repoInfo.Index)
 	if !strings.HasPrefix(server, "https://") {
 		return nil, errors.New("unsupported scheme: https required for trust server")
@@ -186,7 +191,14 @@ func (c *Client) getNotaryRepository(repoInfo *registry.RepositoryInfo, authConf
 	modifiers = append(modifiers, transport.RequestModifier(auth.NewAuthorizer(challengeManager, tokenHandler, basicHandler)))
 	tr := transport.NewTransport(base, modifiers...)
 
-	return client.NewNotaryRepository(c.trustDirectory(), repoInfo.CanonicalName, server, tr, c.getPassphraseRetriever())
+	if passphraseRetriever == nil {
+		if c.ContentTrustFromEnv {
+			passphraseRetriever = NewPassphraseRetrieverFromEnv()
+		} else {
+			passphraseRetriever = NewPassphraseRetriever("", "")
+		}
+	}
+	return client.NewNotaryRepository(c.trustDirectory(), repoInfo.CanonicalName, server, tr, passphraseRetriever)
 }
 
 func (c *Client) trustedTargets(repo, tag string, authConfig AuthConfiguration) ([]target, error) {
@@ -195,7 +207,7 @@ func (c *Client) trustedTargets(repo, tag string, authConfig AuthConfiguration) 
 		return nil, err
 	}
 
-	notaryRepo, err := c.getNotaryRepository(repoInfo, authConfig)
+	notaryRepo, err := c.getNotaryRepository(repoInfo, authConfig, nil)
 	if err != nil {
 		return nil, fmt.Errorf("Error establishing connection to trust repository: %s", err)
 	}
